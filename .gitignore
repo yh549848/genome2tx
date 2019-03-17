@@ -1,5 +1,9 @@
-# TEST DATA
-/test/dataset
+### User defined ###
+# test dataset
+/tests/dataset
+
+# line_profiler
+*.lprof
 
 ### OSX ###
 .DS_Store
