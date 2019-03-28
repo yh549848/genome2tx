@@ -1,5 +1,5 @@
 """
-This is test for geneome2tx
+This is test for genome2tx
 """
 
 import unittest
