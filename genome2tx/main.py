@@ -19,7 +19,6 @@ import yaml
 from gtfparse import read_gtf
 
 
-# @profile
 def to_ranges(positions: Iterable[int]):
     try:
         if len(positions) != len(set(positions)):
@@ -40,40 +39,50 @@ def to_ranges(positions: Iterable[int]):
 
 # @profile
 def offsets(annotations):
-    list_ = []
-    transcript_id = exon_previous = None
+    list_ = [None] * len(annotations)
+    transcript_id_previous = end_previous = None
 
-    for _, exon in annotations.iterrows():
-        if transcript_id != exon['transcript_id']:
-            transcript_id = exon['transcript_id']
-            offset = ~-exon['start']
+    transcript_ids = list(annotations['transcript_id'])
+    starts = list(annotations['start'])
+    ends = list(annotations['end'])
+
+    for i, (t, s, e) in enumerate(zip(transcript_ids, starts, ends)):
+        if transcript_id_previous != t:
+            offset = ~-s
+            transcript_id_previous = t
         else:
-            offset = offset + ~-exon['start'] - exon_previous['end']
+            offset = offset + ~-s - end_previous
 
-        exon_previous = exon
-        list_.append(offset)
+        end_previous = e
+        list_[i] = offset
 
     return list_
 
 
 # @profile
 def exons_overlapped(annotations, strand: str, positions: List[int]):
-    for r in to_ranges(positions):
-        q = "strand == '{0}' & "\
-            "(start >= {1} & start <= {2} | end >= {1} & end <= {2} | start <= {1} & end >= {2})".format(
-                strand, r.start, ~-r.stop)
-        exons = annotations.query(q)
-        yield exons
+    query = '|'.join(["strand == '{0}' & "
+                      "(start >= {1} & start <= {2} | end >= {1} & end <= {2} | start <= {1} & end >= {2})".format(
+                          strand, r.start, ~-r.stop) for r in to_ranges(positions)])
+
+    exons = annotations.query(query)
+    return exons
 
 
 # @profile
 def list_relpositions(positions: List[int], exons):
     list_ = []
-    for _, exon in exons.iterrows():
-        exon_positions = range(exon['start'], -~exon['end'])
+
+    transcript_ids = list(exons['transcript_id'])
+    starts = list(exons['start'])
+    ends = list(exons['end'])
+    offsets = list(exons['offset'])
+
+    for i, (t, s, e, o) in enumerate(zip(transcript_ids, starts, ends, offsets)):
+        exon_positions = range(s, -~e)
         positions_overlapped = sorted(set(positions).intersection(set(exon_positions)))
-        relpositions = [p - exon['offset'] for p in positions_overlapped]
-        list_.append((exon['transcript_id'], relpositions))
+        relpositions = [p - o for p in positions_overlapped]
+        list_[i] = (transcript_ids[i], relpositions)
 
     return list_
 
@@ -98,6 +107,7 @@ def derived_from(query_name):
         sys.stderr.write("Query name ({}) is invalid.".format(query_name))
         return query_name
 
+
 # @profile
 def main():
     options = docopt(__doc__)
@@ -106,14 +116,15 @@ def main():
 
     for path in [gtf_path, bam_path]:
         if not os.path.exists(path):
-            raise Exception("File not exists: {}.".format(path))
+            raise Exception("File not exists!: {}.".format(path))
 
     # NOTE: GENCODE data format;
     # https://www.gencodegenes.org/pages/data_format.html
-    columns_selected = ['seqname', 'strand', 'start', 'end', 'gene_id', 'transcript_id', 'exon_id',
-                        'exon_number']
+    columns_selected = ['seqname', 'strand', 'start', 'end',
+                        'gene_id', 'transcript_id', 'exon_id', 'exon_number']
     annotations = read_gtf(gtf_path).query("feature == 'exon'").filter(columns_selected).sort_values(
         by=['seqname', 'transcript_id', 'exon_number'])
+
     annotations['offset'] = offsets(annotations)
 
     alignments = pysam.AlignmentFile(bam_path, "rb")
@@ -147,33 +158,32 @@ def main():
             ids['unmapped'].append(i)
             continue
 
-        if chromosome != alignment.reference_name:
-            chromosome = alignment.reference_name
+        reference_name = alignment.reference_name
+        if chromosome != reference_name:
+            chromosome = reference_name
             annotations_chr = annotations.query("seqname == '{}'".format(chromosome))
 
         positions = alignment.get_reference_positions()
         strand = '-' if alignment.is_reverse else '+'
 
-        is_assigned = False
-        for exons in exons_overlapped(annotations_chr, strand, positions):
-            if len(exons) < 1:
-                continue
-
-            if derived_from(alignment.query_name) in set(exons['transcript_id']):
-                paired_or_unpaired = 'paired' if alignment.is_paired else 'unpaired'
-                stats['mapped'][paired_or_unpaired] += 1
-                ids['mapped'][paired_or_unpaired].append(i)
-                is_assigned = True
-                break
-
-            # NOTE: Obsoleted exact match
-            # for transcript_id, regions in transcript_relregions(
-            #         list_relpositions(positions, exons)):
-            #     print("\t".join([i, derived_from(alignment.query_name), transcript_id, str(regions)]))
-
-        if not is_assigned:
+        exons = exons_overlapped(annotations_chr, strand, positions)
+        if len(exons) < 1:
             stats['mapped']['tx_unmapped'] += 1
             ids['mapped']['tx_unmapped'].append(i)
+            continue
+
+        if derived_from(alignment.query_name) in set(exons['transcript_id']):
+            paired_or_unpaired = 'paired' if alignment.is_paired else 'unpaired'
+            stats['mapped'][paired_or_unpaired] += 1
+            ids['mapped'][paired_or_unpaired].append(i)
+        else:
+            stats['mapped']['tx_unmapped'] += 1
+            ids['mapped']['tx_unmapped'].append(i)
+
+        # NOTE: Obsoleted exact match
+        # for transcript_id, regions in transcript_relregions(
+        #         list_relpositions(positions, exons)):
+        #     print("\t".join([i, derived_from(alignment.query_name), transcript_id, str(regions)]))
 
     alignments.close()
 
