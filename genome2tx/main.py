@@ -1,4 +1,9 @@
 #! /usr/bin/env python3
+#$ -S $HOME/.pyenv/shims/python3
+#$ -l s_vmem=32G -l mem_req=32G
+#$ -cwd
+#$ -o $HOME/ugelogs/
+#$ -e $HOME/ugelogs/
 
 """
 Convert positions from genome coordinates to transcript coordinates
@@ -17,6 +22,7 @@ from docopt import docopt
 import pysam
 import yaml
 from gtfparse import read_gtf
+from numba import jit
 
 
 def to_ranges(positions: Iterable[int]):
@@ -37,10 +43,10 @@ def to_ranges(positions: Iterable[int]):
         yield range(groups[0][1], -~groups[-1][1])
 
 
-# @profile
+@jit
 def offsets(annotations):
     list_ = [None] * len(annotations)
-    transcript_id_previous = end_previous = None
+    transcript_id_previous = end_previous = offset = None
 
     transcript_ids = list(annotations['transcript_id'])
     starts = list(annotations['start'])
@@ -59,18 +65,24 @@ def offsets(annotations):
     return list_
 
 
-# @profile
+@jit
 def exons_overlapped(annotations, strand: str, positions: List[int]):
-    query = '|'.join(["strand == '{0}' & "
-                      "(start >= {1} & start <= {2} | end >= {1} & end <= {2} | start <= {1} & end >= {2})".format(
-                          strand, r.start, ~-r.stop) for r in to_ranges(positions)])
+    query = ''
+
+    for r in to_ranges(positions):
+        q = "(strand == '{0}' & "\
+            "(start >= {1} & start <= {2} | end >= {1} & end <= {2} | start <= {1} & end >= {2}))".format(
+                strand, r.start, ~-r.stop)
+
+        if query:
+            query += ' | '
+        query += q
 
     exons = annotations.query(query)
     return exons
 
 
-# @profile
-def list_relpositions(positions: List[int], exons):
+def list_relpositions(positions: Iterable[int], exons):
     list_ = []
 
     transcript_ids = list(exons['transcript_id'])
@@ -87,7 +99,6 @@ def list_relpositions(positions: List[int], exons):
     return list_
 
 
-# @profile
 def transcript_relregions(list_relpositions: List[List[int]]):
     list_relpositions.sort(key=lambda x: x[0])
     for transcript_id, g in itertools.groupby(list_relpositions, lambda x: x[0]):
@@ -96,7 +107,6 @@ def transcript_relregions(list_relpositions: List[List[int]]):
         yield transcript_id, relregions
 
 
-# @profile
 def derived_from(query_name):
     # Query name format must be below:
     # readXX/transcript_id
@@ -108,7 +118,6 @@ def derived_from(query_name):
         return query_name
 
 
-# @profile
 def main():
     options = docopt(__doc__)
     gtf_path = options['<gtf>']
