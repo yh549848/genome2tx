@@ -9,7 +9,12 @@
 Convert positions from genome coordinates to transcript coordinates
 
 Usage:
-  genome2tx <gtf> <bam>
+  genome2tx [options] <gtf> <bam>
+
+Options:
+  --strandness TYPE : none/rf/fr [default: none]
+  <gtf>             : GTF formatted gene annotation file
+  <bam>             : BAM (sorted) formatted alignment file
 
 """
 
@@ -17,14 +22,14 @@ import os
 import sys
 import itertools
 import copy
-from typing import Iterable, List
+from typing import Iterable
 import time
 
 from docopt import docopt
 import pysam
 import yaml
 from gtfparse import read_gtf
-import sqlite3
+from sqlite3 import Row
 from sqlalchemy import create_engine
 from numba import jit
 
@@ -45,6 +50,48 @@ def to_ranges(positions: Iterable[int]):
         groups = list(g)
         range_ = range(groups[0][1], -~groups[-1][1])
         yield range_
+
+
+@jit
+def strand_str(alignment, strandness):
+    # TODO: Stranded sequence
+    return '+' if alignment.is_reverse else '-'
+    if strandness == 'rf':
+        return '+' if alignment.is_reverse else '-'
+    elif strandness == 'fr':
+        return '-' if alignment.is_reverse else '+'
+    else:
+        return ('+', '-')
+
+
+def load_annotations(gtf_path, columns: list, features=['exon']):
+    # NOTE: GENCODE data format;
+    # https://www.gencodegenes.org/pages/data_format.html
+    annotations = read_gtf(
+        gtf_path,
+        features=features).filter(
+            columns).sort_values(by=['seqname', 'transcript_id', 'exon_number'])
+    return annotations
+
+
+def load_alignments(bam_path):
+    # NOTE: pysam.AlignedSegment;
+    # https://pysam.readthedocs.io/en/latest/api.html#pysam.AlignedSegment
+    THREADS = 1
+
+    try:
+        alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
+        alignments.check_index()
+    except (ValueError, AttributeError) as e:
+        sys.stderr.write("Index is not found: {}".format(e))
+        sys.stderr.write('Create index...')
+        pysam.index(bam_path)
+        alignments.check_index()
+    except Exception as e:
+        sys.stderr.write("Alignments file open was failed: {}".format(e))
+        sys.exit()
+
+    return alignments
 
 
 @jit
@@ -69,51 +116,76 @@ def offsets(annotations):
     return offsets
 
 
-@jit
-def create_db_engine(annotations,
-                     chromosomes,
-                     table='exons',
-                     columns_index=['strand', 'start', 'end']):
+def create_db_engine(
+        annotations,
+        chromosomes,
+        table='exons',
+        columns_index=['strand', 'start', 'end', ('strand', 'start'), ('strand', 'end')]):
     db_engine = create_engine('sqlite://', echo=False)
-    db_engine.row_factory = sqlite3.Row
+    db_engine.row_factory = Row
     annotations.query(
         "seqname == {}".format(chromosomes)
     ).to_sql(table, con=db_engine, if_exists='replace')
 
-    # OPTIMIZE: Reconsider target columns
     for c in columns_index:
-        q = "CREATE INDEX ix_{0}_{1} on {0}({1});".format(table, c)
-        _ = db_engine.execute(q)
+        if type(c) is str:
+            c = (c, )
+        query = "CREATE INDEX ix_{0}_{1} on {0}({2})".format(
+            table,
+            '_'.join(c),
+            ', '.join(c))
+        db_engine.execute(query)
 
     return db_engine
 
 
 @jit
-# @profile
-def exons_overlapped(annotations, strand: str,
-                     positions: List[int],
-                     columns='transcript_id'):
+def build_query(strand, positions, table, columns):
     columns_str = ', '.join(columns)
     query = ''
 
-    # HACK: Consider query building
+    # FIXME:
+    if strand == ('+', '-'):
+        where_clauses = [
+            "start >= {1} AND start <= {2}",
+            "end >= {1} AND end <= {2}",
+            # "start <= {1} AND end >= {2}"
+        ]
+    else:
+        where_clauses = [
+            "strand = '{0}' AND start >= {1} AND start <= {2}",
+            "strand = '{0}' AND end >= {1} AND end <= {2}",
+            # "strand = '{0}' AND start <= {1} AND end >= {2}"
+        ]
+
     for r in to_ranges(positions):
-        where_ = "(strand = '{0}' AND ("\
-                 "start >= {1} AND start <= {2} OR "\
-                 "end >= {1} AND end <= {2} OR "\
-                 "start <= {1} AND end >= {2})"\
-                 ")".format(
-                     strand, r.start, ~-r.stop)
+        for w in where_clauses:
+            if query:
+                query += ' UNION ALL '
+            query += "SELECT {} FROM {} WHERE {}".format(
+                columns_str,
+                table,
+                w.format(strand, r.start, ~-r.stop))
 
-        if query:
-            query += ' UNION '
-        query += "SELECT {} FROM exons WHERE {}".format(columns_str, where_)
+    return query
 
-    exons = annotations.execute(query).fetchall()
-    return exons
+
+@jit
+def overlaps(
+        strand,
+        positions,
+        annotations,
+        table='exons',
+        columns=['transcript_id']):
+    results = annotations.execute(build_query(strand, positions, table, columns)).fetchall()
+    return results
 
 
 def transcript_id_derived_from(query_name):
+    # NOTE: polyester generated reads are named according to the format:
+    # 'readX/transcript_id'
+    # e.g. read1/ENST00000501122.2
+
     try:
         transcript_id = query_name.split('/')[1]
         return transcript_id
@@ -122,8 +194,7 @@ def transcript_id_derived_from(query_name):
         return query_name
 
 
-def init_stats(keys_=[{'mapped': [{'true': ['paired', 'unpaired'], 'false': ['paired', 'unpaired']}]}, 'unmapped'],
-               default=None):
+def init_stats(keys_, default=None):
     stats = {}
 
     for key in keys_:
@@ -136,10 +207,10 @@ def init_stats(keys_=[{'mapped': [{'true': ['paired', 'unpaired'], 'false': ['pa
     return stats
 
 
-def count_up_dict(dict_):
+def counted_up_dict(dict_):
     for k, v in dict_.items():
         if type(v) is dict:
-            dict_[k] = count_up_dict(v)
+            dict_[k] = counted_up_dict(v)
         else:
             dict_[k] = len(v)
 
@@ -149,7 +220,7 @@ def count_up_dict(dict_):
 def print_results(stats: dict):
     print('-' * 80)
     print(yaml.dump(stats))
-    print(count_up_dict(copy.deepcopy(stats)))
+    print(counted_up_dict(copy.deepcopy(stats)))
 
 
 # TODO: Exact match
@@ -179,11 +250,11 @@ def print_results(stats: dict):
 #         yield transcript_id, relregions
 
 
-# @profile
 def main():
     start = time.time()
 
     options = docopt(__doc__)
+    strandness = options['--strandness']
     gtf_path = options['<gtf>']
     bam_path = options['<bam>']
 
@@ -195,14 +266,9 @@ def main():
             sys.stderr.write(e)
             sys.exit(1)
 
-    # NOTE: GENCODE data format;
-    # https://www.gencodegenes.org/pages/data_format.html
     columns_select = ['seqname', 'strand', 'start', 'end',
                       'transcript_id', 'exon_number']
-    annotations = read_gtf(gtf_path,
-                           features=['exon']).filter(
-                               columns_select).sort_values(
-                                   by=['seqname', 'transcript_id', 'exon_number'])
+    annotations = load_annotations(gtf_path, columns_select)
 
     print('gtfparse:', time.time() - start)
 
@@ -211,27 +277,18 @@ def main():
 
     print('offsets:', time.time() - start)
 
-    # NOTE: pysam.AlignedSegment;
-    # https://pysam.readthedocs.io/en/latest/api.html#pysam.AlignedSegment
-    THREADS = 2
-    try:
-        alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
-        alignments.check_index()
-    except (ValueError, AttributeError) as e:
-        sys.stderr.write("Index is not found: {}".format(e))
-        sys.stderr.write('Create index...')
-        pysam.index(bam_path)
-        alignments.check_index()
-    except Exception as e:
-        sys.stderr.write("Alignments file open was failed: {}".format(e))
-        sys.exit()
+    alignments = load_alignments(bam_path)
 
     print('load_alignments:', time.time() - start)
-    stats = init_stats()
+
+    keys = [{'mapped': [{'true': ['paired', 'unpaired'],
+                         'false': ['paired', 'unpaired']}]},
+            'unmapped']
+    stats = init_stats(keys)
     chromosome = None
     for i, alignment in enumerate(alignments.fetch(contig='chr1')):
 
-        if i % 1000 == 0:
+        if i % 100000 == 0:
             print('alignment-{}:'.format(i), time.time() - start)
 
         if alignment.is_unmapped:
@@ -247,11 +304,12 @@ def main():
             chromosome = reference_name
             annotations_chrXX = create_db_engine(annotations, [chromosome])
 
+        strand = strand_str(alignment, strandness)
+        # NOTE: pysam return 0 based postions
         positions = alignment.get_reference_positions()
-        strand = '-' if alignment.is_reverse else '+'
 
-        exons = exons_overlapped(annotations_chrXX, strand, positions, columns_select)
-        transcript_ids = {e['transcript_id'] for e in exons}
+        exons_overlapped = overlaps(strand, positions, annotations_chrXX)
+        transcript_ids = {e['transcript_id'] for e in exons_overlapped}
         paired_or_unpaired = 'paired' if alignment.is_paired else 'unpaired'
 
         if len(transcript_ids) < 1:
@@ -261,11 +319,6 @@ def main():
 
         true_or_false = 'true' if transcript_id_derived_from(alignment.query_name) in transcript_ids else 'false'
         stats[mapped_or_unmapped][true_or_false][paired_or_unpaired].append(i)
-
-        # TODO: Exact match
-        # for transcript_id, regions in transcript_relregions(
-        #         list_relpositions(positions, exons)):
-        #             pass
 
     annotations_chrXX = None
     alignments.close()
