@@ -1,9 +1,9 @@
 #! /usr/bin/env python3
-#$ -S $HOME/.pyenv/shims/python3
-#$ -l s_vmem=32G -l mem_req=32G
-#$ -cwd
-#$ -o $HOME/ugelogs/
-#$ -e $HOME/ugelogs/
+# $ -S $HOME/.pyenv/shims/python3
+# $ -l s_vmem=32G -l mem_req=32G
+# $ -cwd
+# $ -o $HOME/ugelogs/
+# $ -e $HOME/ugelogs/
 
 """
 Convert positions from genome coordinates to transcript coordinates
@@ -28,6 +28,7 @@ import time
 from docopt import docopt
 import pysam
 import yaml
+import pandas as pd
 from gtfparse import read_gtf
 from sqlite3 import Row
 from sqlalchemy import create_engine
@@ -55,22 +56,42 @@ def to_ranges(positions: Iterable[int]):
 @jit
 def strand_str(alignment, strandness):
     # TODO: Stranded sequence
-    return '+' if alignment.is_reverse else '-'
     if strandness == 'rf':
-        return '+' if alignment.is_reverse else '-'
+        if alignment.is_read1:
+            return '+' if alignment.is_reverse else '-'
+        else:
+            return '-' if alignment.is_reverse else '+'
     elif strandness == 'fr':
-        return '-' if alignment.is_reverse else '+'
+        if alignment.is_read1:
+            return '-' if alignment.is_reverse else '+'
+        else:
+            return '+' if alignment.is_reverse else '-'
     else:
         return ('+', '-')
 
 
-def load_annotations(gtf_path, columns: list, features=['exon']):
-    # NOTE: GENCODE data format;
-    # https://www.gencodegenes.org/pages/data_format.html
+def pickle_annotations(gtf_path, columns: list, features=['exon']):
     annotations = read_gtf(
         gtf_path,
         features=features).filter(
             columns).sort_values(by=['seqname', 'transcript_id', 'exon_number'])
+
+    annotations.to_pickle("annotations.pkl")
+    sys.exit()
+
+
+def load_annotations(gtf_path, columns: list, features=['exon']):
+    if not __debug__:
+        # load from pickled object
+        annotations = pd.read_pickle(gtf_path)
+        return annotations
+
+    # NOTE: GENCODE data format;
+    # https://www.gencodegenes.org/pages/data_format.html
+    annotations = read_gtf(gtf_path
+                           ).query("feature == {}".format(features)).filter(
+        columns).sort_values(by=['seqname', 'transcript_id', 'exon_number'])
+
     return annotations
 
 
@@ -120,7 +141,7 @@ def create_db_engine(
         annotations,
         chromosomes,
         table='exons',
-        columns_index=['strand', 'start', 'end', ('strand', 'start'), ('strand', 'end')]):
+        columns_index=['strand', 'transcript_id', 'start', 'end', ('strand', 'transcript_id'),  ('strand', 'start'), ('strand', 'end'), ('strand', 'start', 'end')]):
     db_engine = create_engine('sqlite://', echo=False)
     db_engine.row_factory = Row
     annotations.query(
@@ -139,33 +160,50 @@ def create_db_engine(
     return db_engine
 
 
-@jit
-def build_query(strand, positions, table, columns):
+# @jit
+# def _build_query(strand, positions, table, columns):
+#     columns_str = ', '.join(columns)
+#     query = ''
+
+#     # FIXME:
+#     if strand == ('+', '-'):
+#         where_clauses = [
+#             "start >= {1} AND start <= {2}",
+#             "end >= {1} AND end <= {2}",
+#             "start <= {1} AND end >= {2}"
+#         ]
+#     else:
+#         where_clauses = [
+#             "strand = '{0}' AND start >= {1} AND start <= {2}",
+#             "strand = '{0}' AND end >= {1} AND end <= {2}",
+#             "strand = '{0}' AND start <= {1} AND end >= {2}"
+#         ]
+
+#     for r in to_ranges(positions):
+#         for w in where_clauses:
+#             if query:
+#                 query += ' UNION ALL '
+#             query += "SELECT {} FROM {} WHERE {}".format(
+#                 columns_str,
+#                 table,
+#                 w.format(strand, r.start + 1, r.stop - 2))
+
+#     print(query)
+#     return query
+
+
+def build_query(strand, transcript_id, table, columns):
     columns_str = ', '.join(columns)
-    query = ''
 
-    # FIXME:
     if strand == ('+', '-'):
-        where_clauses = [
-            "start >= {1} AND start <= {2}",
-            "end >= {1} AND end <= {2}",
-            # "start <= {1} AND end >= {2}"
-        ]
+        where_clause = "transcript_id == '{}'".format(transcript_id)
     else:
-        where_clauses = [
-            "strand = '{0}' AND start >= {1} AND start <= {2}",
-            "strand = '{0}' AND end >= {1} AND end <= {2}",
-            # "strand = '{0}' AND start <= {1} AND end >= {2}"
-        ]
+        where_clause = "strand = '{}' AND transcript_id == '{}'".format(strand, transcript_id)
 
-    for r in to_ranges(positions):
-        for w in where_clauses:
-            if query:
-                query += ' UNION ALL '
-            query += "SELECT {} FROM {} WHERE {}".format(
+    query = "SELECT {} FROM {} WHERE {}".format(
                 columns_str,
                 table,
-                w.format(strand, r.start, ~-r.stop))
+                where_clause)
 
     return query
 
@@ -173,12 +211,25 @@ def build_query(strand, positions, table, columns):
 @jit
 def overlaps(
         strand,
-        positions,
+        transcript_id,
         annotations,
         table='exons',
-        columns=['transcript_id']):
-    results = annotations.execute(build_query(strand, positions, table, columns)).fetchall()
+        columns=['start', 'end']):
+    results = annotations.execute(build_query(
+        strand, transcript_id, table, columns)).fetchall()
     return results
+
+
+# @jit
+# def overlaps(
+#         strand,
+#         positions,
+#         annotations,
+#         table='exons',
+#         columns=['transcript_id']):
+#     results = annotations.execute(build_query(
+#         strand, positions, table, columns)).fetchall()
+#     return results
 
 
 def transcript_id_derived_from(query_name):
@@ -187,7 +238,7 @@ def transcript_id_derived_from(query_name):
     # e.g. read1/ENST00000501122.2
 
     try:
-        transcript_id = query_name.split('/')[1]
+        transcript_id = query_name.split('/')[1].split('|')[0]
         return transcript_id
     except Exception:
         sys.stderr.write("Query name ({}) is invalid.".format(query_name))
@@ -281,12 +332,10 @@ def main():
 
     print('load_alignments:', time.time() - start)
 
-    keys = [{'mapped': [{'true': ['paired', 'unpaired'],
-                         'false': ['paired', 'unpaired']}]},
-            'unmapped']
+    keys = [{'mapped': ['true', 'false']}, 'unmapped']
     stats = init_stats(keys)
     chromosome = None
-    for i, alignment in enumerate(alignments.fetch(contig='chr1')):
+    for i, alignment in enumerate(alignments.fetch()):
 
         if i % 100000 == 0:
             print('alignment-{}:'.format(i), time.time() - start)
@@ -308,17 +357,21 @@ def main():
         # NOTE: pysam return 0 based postions
         positions = alignment.get_reference_positions()
 
-        exons_overlapped = overlaps(strand, positions, annotations_chrXX)
-        transcript_ids = {e['transcript_id'] for e in exons_overlapped}
-        paired_or_unpaired = 'paired' if alignment.is_paired else 'unpaired'
+        transcript_id = transcript_id_derived_from(alignment.query_name)
+        exons_overlapped = overlaps(strand, transcript_id, annotations_chrXX)
+        # NOTE: ajust to 0 based positions
+        positions_exons = set().union(*[set(range(e[0] - 1, e[1])) for e in exons_overlapped])
 
-        if len(transcript_ids) < 1:
+        # CASE: TRUE POSITIVE
+        if len(positions_exons.intersection(positions)) > 1:
+            true_or_false = 'true'
+        else:
             true_or_false = 'false'
-            stats[mapped_or_unmapped][true_or_false][paired_or_unpaired].append(i)
-            continue
 
-        true_or_false = 'true' if transcript_id_derived_from(alignment.query_name) in transcript_ids else 'false'
-        stats[mapped_or_unmapped][true_or_false][paired_or_unpaired].append(i)
+        stats[mapped_or_unmapped][true_or_false].append(i)
+
+        # print("{} query_name: {} {} {}".format(i, alignment.query_name, str(alignment.is_reverse), true_or_false))
+        # print("{}\n{}".format(list(to_ranges(positions)), list(to_ranges(positions_exons))))
 
     annotations_chrXX = None
     alignments.close()
