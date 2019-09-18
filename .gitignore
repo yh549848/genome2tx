@@ -4,6 +4,7 @@
 
 # line_profiler
 *.lprof
+*.lprof.log
 
 ### OSX ###
 .DS_Store
