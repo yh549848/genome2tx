@@ -238,7 +238,7 @@ def transcript_id_derived_from(query_name):
     # e.g. read1/ENST00000501122.2
 
     try:
-        transcript_id = query_name.split('/')[1].split('|')[0]
+        transcript_id = query_name.split('/')[1].split(';')[0]
         return transcript_id
     except Exception:
         sys.stderr.write("Query name ({}) is invalid.".format(query_name))
