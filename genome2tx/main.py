@@ -104,13 +104,15 @@ def load_alignments(bam_path):
         alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
         alignments.check_index()
     except (ValueError, AttributeError) as e:
-        sys.stderr.write("Index is not found: {}".format(e))
+        sys.stderr.write("Index is not found: {}\n".format(e))
         sys.stderr.write('Create index...')
         pysam.index(bam_path)
-        alignments.check_index()
-    except Exception as e:
-        sys.stderr.write("Alignments file open was failed: {}".format(e))
-        sys.exit()
+        try:
+            alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
+            alignments.check_index()
+        except Exception as e:
+            sys.stderr.write("Alignments file open was failed: {}\n".format(e))
+            sys.exit()
 
     return alignments
 
@@ -241,7 +243,7 @@ def transcript_id_derived_from(query_name):
         transcript_id = query_name.split('/')[1].split(';')[0]
         return transcript_id
     except Exception:
-        sys.stderr.write("Query name ({}) is invalid.".format(query_name))
+        sys.stderr.write("Query name ({}) is invalid.\n".format(query_name))
         return query_name
 
 
@@ -314,7 +316,7 @@ def main():
             if not os.path.exists(path):
                 raise Exception("File not exists!: {}.".format(path))
         except Exception as e:
-            sys.stderr.write(e)
+            sys.stderr.write(e.args)
             sys.exit(1)
 
     columns_select = ['seqname', 'strand', 'start', 'end',
