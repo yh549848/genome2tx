@@ -272,7 +272,8 @@ def counted_up_dict(dict_):
 
 def print_results(stats: dict):
     print('-' * 80)
-    print(yaml.dump(stats))
+    # NOTE: Omit
+    # print(yaml.dump(stats))
     print(counted_up_dict(copy.deepcopy(stats)))
 
 
@@ -339,7 +340,7 @@ def main():
     chromosome = None
     for i, alignment in enumerate(alignments.fetch()):
 
-        if i % 100000 == 0:
+        if i % 1000000 == 0:
             print('alignment-{}:'.format(i), time.time() - start)
 
         if alignment.is_unmapped:
@@ -371,9 +372,6 @@ def main():
             true_or_false = 'false'
 
         stats[mapped_or_unmapped][true_or_false].append(i)
-
-        # print("{} query_name: {} {} {}".format(i, alignment.query_name, str(alignment.is_reverse), true_or_false))
-        # print("{}\n{}".format(list(to_ranges(positions)), list(to_ranges(positions_exons))))
 
     annotations_chrXX = None
     alignments.close()
