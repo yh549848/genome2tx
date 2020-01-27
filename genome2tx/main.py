@@ -13,6 +13,7 @@ Usage:
 
 Options:
   --strandness TYPE : none/rf/fr [default: none]
+  --threads NUM     : Number of threds [default: 1]
   <gtf>             : GTF formatted gene annotation file
   <bam>             : BAM (sorted) formatted alignment file
 
@@ -27,7 +28,6 @@ import time
 
 from docopt import docopt
 import pysam
-import yaml
 import pandas as pd
 from gtfparse import read_gtf
 from sqlite3 import Row
@@ -95,20 +95,19 @@ def load_annotations(gtf_path, columns: list, features=['exon']):
     return annotations
 
 
-def load_alignments(bam_path):
+def load_alignments(bam_path, threads=1):
     # NOTE: pysam.AlignedSegment;
     # https://pysam.readthedocs.io/en/latest/api.html#pysam.AlignedSegment
-    THREADS = 1
 
     try:
-        alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
+        alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=threads)
         alignments.check_index()
     except (ValueError, AttributeError) as e:
         sys.stderr.write("Index is not found: {}\n".format(e))
         sys.stderr.write('Create index...')
         pysam.index(bam_path)
         try:
-            alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=THREADS)
+            alignments = pysam.AlignmentFile(bam_path, mode='rb', threads=threads)
             alignments.check_index()
         except Exception as e:
             sys.stderr.write("Alignments file open was failed: {}\n".format(e))
@@ -309,6 +308,7 @@ def main():
 
     options = docopt(__doc__)
     strandness = options['--strandness']
+    threads = options['--threads']
     gtf_path = options['<gtf>']
     bam_path = options['<bam>']
 
@@ -331,7 +331,7 @@ def main():
 
     print('offsets:', time.time() - start)
 
-    alignments = load_alignments(bam_path)
+    alignments = load_alignments(bam_path, threads)
 
     print('load_alignments:', time.time() - start)
 
