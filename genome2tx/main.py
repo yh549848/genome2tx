@@ -22,7 +22,6 @@ Options:
 import os
 import sys
 import itertools
-import copy
 from typing import Iterable
 import time
 
@@ -33,6 +32,8 @@ from gtfparse import read_gtf
 from sqlite3 import Row
 from sqlalchemy import create_engine
 from numba import jit
+
+from functools import lru_cache
 
 
 def to_ranges(positions: Iterable[int]):
@@ -53,7 +54,6 @@ def to_ranges(positions: Iterable[int]):
         yield range_
 
 
-@jit
 def strand_str(alignment, strandness):
     # TODO: Stranded sequence
     if strandness == 'rf':
@@ -116,7 +116,6 @@ def load_alignments(bam_path, threads=1):
     return alignments
 
 
-@jit
 def offsets(annotations):
     offsets = [None] * len(annotations)
     transcript_id_previous = end_previous = offset = None
@@ -161,38 +160,7 @@ def create_db_engine(
     return db_engine
 
 
-# @jit
-# def _build_query(strand, positions, table, columns):
-#     columns_str = ', '.join(columns)
-#     query = ''
-
-#     # FIXME:
-#     if strand == ('+', '-'):
-#         where_clauses = [
-#             "start >= {1} AND start <= {2}",
-#             "end >= {1} AND end <= {2}",
-#             "start <= {1} AND end >= {2}"
-#         ]
-#     else:
-#         where_clauses = [
-#             "strand = '{0}' AND start >= {1} AND start <= {2}",
-#             "strand = '{0}' AND end >= {1} AND end <= {2}",
-#             "strand = '{0}' AND start <= {1} AND end >= {2}"
-#         ]
-
-#     for r in to_ranges(positions):
-#         for w in where_clauses:
-#             if query:
-#                 query += ' UNION ALL '
-#             query += "SELECT {} FROM {} WHERE {}".format(
-#                 columns_str,
-#                 table,
-#                 w.format(strand, r.start + 1, r.stop - 2))
-
-#     print(query)
-#     return query
-
-
+@lru_cache(maxsize=None)
 def build_query(strand, transcript_id, table, columns):
     columns_str = ', '.join(columns)
 
@@ -209,30 +177,18 @@ def build_query(strand, transcript_id, table, columns):
     return query
 
 
-@jit
-def overlaps(
+def query_exons(
         strand,
         transcript_id,
         annotations,
         table='exons',
         columns=['start', 'end']):
     results = annotations.execute(build_query(
-        strand, transcript_id, table, columns)).fetchall()
+        strand, transcript_id, table, tuple(columns))).fetchall()
     return results
 
 
-# @jit
-# def overlaps(
-#         strand,
-#         positions,
-#         annotations,
-#         table='exons',
-#         columns=['transcript_id']):
-#     results = annotations.execute(build_query(
-#         strand, positions, table, columns)).fetchall()
-#     return results
-
-
+@lru_cache(maxsize=None)
 def transcript_id_derived_from(query_name):
     # NOTE: polyester generated reads are named according to the format:
     # 'readX/transcript_id'
@@ -244,6 +200,10 @@ def transcript_id_derived_from(query_name):
     except Exception:
         sys.stderr.write("Query name ({}) is invalid.\n".format(query_name))
         return query_name
+
+
+def to_set_ranges(exons):
+    return set().union(*[set(range(e[0] - 1, e[1])) for e in exons])
 
 
 def init_stats(keys_, default=None):
@@ -269,46 +229,12 @@ def counted_up_dict(dict_):
     return dict_
 
 
-def print_results(stats: dict):
-    print('-' * 80)
-    # NOTE: Omit
-    # print(yaml.dump(stats))
-    print(counted_up_dict(copy.deepcopy(stats)))
-
-
-# TODO: Exact match
-# def list_relpositions(positions: Iterable[int], exons):
-#     list_ = []
-
-#     transcript_ids = list(exons['transcript_id'])
-#     starts = list(exons['start'])
-#     ends = list(exons['end'])
-#     offsets = list(exons['offset'])
-
-#     for i, (t, s, e, o) in enumerate(zip(transcript_ids, starts, ends, offsets)):
-#         exon_positions = range(s, -~e)
-#         positions_overlapped = sorted(set(positions).intersection(set(exon_positions)))
-#         relpositions = [p - o for p in positions_overlapped]
-#         list_[i] = (transcript_ids[i], relpositions)
-
-#     return list_
-
-
-# TODO: Exact match
-# def transcript_relregions(list_relpositions: List[List[int]]):
-#     list_relpositions.sort(key=lambda x: x[0])
-#     for transcript_id, g in itertools.groupby(list_relpositions, lambda x: x[0]):
-#         relregions = list(to_ranges([p for positions in g for p in positions[1]]))
-
-#         yield transcript_id, relregions
-
-
 def main():
     start = time.time()
 
     options = docopt(__doc__)
     strandness = options['--strandness']
-    threads = options['--threads']
+    threads = int(options['--threads'])
     gtf_path = options['<gtf>']
     bam_path = options['<bam>']
 
@@ -324,64 +250,56 @@ def main():
                       'transcript_id', 'exon_number']
     annotations = load_annotations(gtf_path, columns_select)
 
-    print('gtfparse:', time.time() - start)
-
     annotations['offset'] = offsets(annotations)
     columns_select.append('offset')
 
-    print('offsets:', time.time() - start)
-
     alignments = load_alignments(bam_path, threads)
 
-    print('load_alignments:', time.time() - start)
-
-    keys = [{'mapped': ['true', 'false']}, 'unmapped']
-    stats = init_stats(keys)
     chromosome = None
     for i, alignment in enumerate(alignments.fetch()):
-
         if i % 1000000 == 0:
-            print('alignment-{}:'.format(i), time.time() - start)
+            sys.stderr.write('row-{}: {}'.format(i, time.time() - start))
 
         if alignment.is_unmapped:
-            mapped_or_unmapped = 'unmapped'
-            stats[mapped_or_unmapped].append(i)
+            judge = None
+            print(*[i, alignment.query_name, judge], sep="\t")
             continue
-
-        mapped_or_unmapped = 'mapped'
 
         # OPTIMIZE: Total or partial?
         reference_name = alignment.reference_name
         if chromosome != reference_name:
             chromosome = reference_name
             annotations_chrXX = create_db_engine(annotations, [chromosome])
+            sys.stderr.write('Entered in {}'.format(chromosome))
 
         strand = strand_str(alignment, strandness)
+
         # NOTE: pysam return 0 based postions
         positions = alignment.get_reference_positions()
 
         transcript_id = transcript_id_derived_from(alignment.query_name)
-        exons_overlapped = overlaps(strand, transcript_id, annotations_chrXX)
+        exons_defined = query_exons(strand, transcript_id, annotations_chrXX)
+
+        if len(exons_defined) < 1:
+            judge = False
+            print(*[i, alignment.query_name, judge], sep="\t")
+            continue
+
         # NOTE: ajust to 0 based positions
-        positions_exons = set().union(*[set(range(e[0] - 1, e[1])) for e in exons_overlapped])
+        positions_exons = to_set_ranges(exons_defined)
 
-        # CASE: TRUE POSITIVE
         if len(positions_exons.intersection(positions)) > 1:
-            true_or_false = 'true'
+            judge = True
         else:
-            true_or_false = 'false'
+            judge = False
 
-        stats[mapped_or_unmapped][true_or_false].append(i)
+        print(*[i, alignment.query_name, judge], sep="\t")
 
     annotations_chrXX = None
     alignments.close()
-
-    print('close:', time.time() - start)
-
-    print_results(stats)
 
 
 if __name__ == '__main__':
     start = time.time()
     main()
-    print('main:', time.time() - start)
+    sys.stderr.write("main: {}".format(time.time() - start))
